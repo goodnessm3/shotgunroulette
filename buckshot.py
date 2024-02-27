@@ -4,8 +4,8 @@ from collections import defaultdict
 ITEMS = ["cuff", "beer", "saw", "cigs", "glass"]
 # other commands are sopp and sself for shoot opponent and self respectively
 LIVES = 4
-MIN_SIZE = 2
-MAG_SIZE = 6
+MIN_SIZE = 3
+MAG_SIZE = 8
 CIG_INCREMENT = 1  # how much cigs heal  you
 PLIVES = 4
 DLIVES = 4  # how many lives does each player start with
@@ -22,9 +22,13 @@ class Shotgun:
     def load(self):
 
         self.mag = []
-        nm = random.randint(self.min_size, self.mag_size)
-        for x in range(nm):
-            self.mag.append(random.choice((True, False)))  # True = live shell
+
+        size = random.randint(MIN_SIZE, MAG_SIZE)
+        part = random.randint(int(size * 0.35), int((size+1)/2))  # distributions too far to either end not fun
+        ls = [False] * part + [True] * (size - part)  # True = live shell
+        random.shuffle(ls)
+        self.mag.extend(ls)
+
         return self.mag.count(True), self.mag.count(False)  # return distribution of contents
 
     def fire(self):
@@ -87,6 +91,8 @@ class GameState:
         self.blank_shells = blank_shells
         self.probability = probability  # updated when the AI makes this as a simulation
         self.label = ""  # for printing/debugging
+        self.parent = None
+        self.command = None  # the command that created this state
 
     @property
     def player_lives(self):
@@ -115,6 +121,7 @@ class GameState:
     def print(self):
 
         out = f"PROBABILITY: {self.probability} = {self.label} HEURISTIC: {self.heuristic()}\n"
+        out += f"PARENT: {id(self.parent)}\n"
 
         plist = ", ".join(self.player_items)
         dlist = ", ".join(self.dealer_items)
@@ -131,6 +138,10 @@ class GameState:
             out += "GUN SAWN"
 
         return out
+
+    def simple_print(self):
+
+        return f"PLAYER: {self.player_lives}\nDEALER: {self.dealer_lives}\n{self.live_shells} live, {self.blank_shells} blank."
 
     def get_copy(self):
 
@@ -321,8 +332,8 @@ class Game:
 
         for q in ITEMS:
             # TODO: temporary, some default items
-            self.game_state.dealer_items.extend([q]*2)
-            self.game_state.player_items.extend([q]*2)
+            self.game_state.dealer_items.extend([q])
+            self.game_state.player_items.extend([q])
 
         self.log(f"{self.game_state.current_turn}'s turn.")
 
@@ -423,8 +434,59 @@ class AI:
         self.game = game  # the game that is actually running, the gun belongs to this object
         self.game_runner = GameRunner()  # AI's own game runner to simulate actions
 
+    def simulate_options(self, state):
+
+        """Given a state, return it if the current player has flipped. Else, evaluate all
+        possible options and return those as a list."""
+
+        accu = []
+        opts = self.get_options_new(state)
+        for i in opts:
+            new_states = self.create_state(state, i)  # a tuple of len 1 or 2
+            for j in new_states:
+                if j.current_turn == "PLAYER" or j.live_shells == j.blank_shells == 0:
+                    # don't try to look beyond a new round, pointless to try and predict, I think
+                    accu.append(j)
+                else:
+                    accu.extend(self.simulate_options(j))
+
+        return accu
+
     def take_turn(self):
 
+        tree = self.simulate_options(self.game.game_state)
+        print(f"Computed {len(tree)} future states.")
+
+        tmpdc = defaultdict(lambda: 0)
+        best = None
+        best_score = -9999999  # todo - do it better, it could be we are dealing with "least bad" option
+
+        for q in tree:
+            this = q
+            path_length = 0
+            while this.parent:
+                tmpdc[q] += this.heuristic()
+                this = this.parent
+                path_length += 1
+            if float(tmpdc[q])/path_length > best_score:  # normalize for path length
+                best_score = float(tmpdc[q])/path_length
+                best = q
+
+        #print(f"Best path with score {best_score}: ")
+        path = []
+        this = best
+        todo = None
+        while this.parent:
+            path.append(this.command)
+            if this.command:
+                todo = this.command
+            this = this.parent
+        path.reverse()
+        #print(" -> ".join(path))
+
+        return todo
+
+        '''  # old func
         opts = self.get_options()
         future_states = []
         heuristics = []  # work out how good each option is, we need to add two
@@ -438,27 +500,16 @@ class AI:
             heuristics.sort(key=lambda m: m[1])  # sort by goodness score in tuple
             future_states.extend(outcomes)
 
-        #print("HEURISTICS FOR POSSIBLE COMMANDS:")
-        #for x, y in heuristics:
-            #print(x, ": ", y)
-
-        #for k in future_states:
-            #print("Possible state:")
-            #print(k.print())
-            #print("++++++++++++++++++")
-
         return heuristics[-1][0]  # the command inside the tuple that was sorted the highest score
-
-        '''
-        live_prob = self.game.gun.live_probability()
-        if live_prob > 0.5:
-            print("### live prob > 0.5, shooting you")
-            return "sopp"
-        else:
-            print("### live prob < 0.5, shooting myself")
-            return "sself"
         '''
 
+    def get_options_new(self, state):
+
+        out = ["sopp", "sself"] + state.dealer_items
+        while "glass" in out:
+            out.remove("glass")  # glass is not used in simulation, because it doesn't change anything
+
+        return set(out)  # only evaluate each option once
     def get_options(self):
 
         """All the things the AI can possibly do this turn."""
@@ -475,28 +526,39 @@ class AI:
         state object having copied the original one, which is not mutated. Live_shell is True or False
         and is needed to decide whether to run a shooting function."""
 
+        out = []
+
         if cmd in ["sself", "sopp", "beer"]:  # these are the only commands that "branch"
             prob = state.live_probability()
 
-            new_true = state.get_copy()
-            self.game_runner.evaluate_command(new_true, cmd, True)
-            new_true.probability = prob  # annotate the state with probability of occurrence
-            new_true.label = f"Dealer used {cmd} with live shell"
+            if state.live_shells > 0:
+                new_true = state.get_copy()
+                self.game_runner.evaluate_command(new_true, cmd, True)
+                new_true.probability = prob  # annotate the state with probability of occurrence
+                new_true.label = f"Dealer used {cmd} with live shell"
+                new_true.parent = state  # label with what state it came from for tree navigation
+                new_true.command = cmd
+                out.append(new_true)
 
-            new_false = state.get_copy()
-            self.game_runner.evaluate_command(new_false, cmd, False)
-            new_false.probability = 1.0 - prob
-            new_false.label = f"Dealer used {cmd} with blank shell"
-
-            return new_true, new_false
+            if state.blank_shells > 0:
+                new_false = state.get_copy()
+                self.game_runner.evaluate_command(new_false, cmd, False)
+                new_false.probability = 1.0 - prob
+                new_false.label = f"Dealer used {cmd} with blank shell"
+                new_false.parent = state
+                new_false.command = cmd
+                out.append(new_false)
 
         else:
             new = state.get_copy()
             self.game_runner.evaluate_command(new, cmd, None)  # live_shell arg does not matter for these cmds
             new.probability = 1.0  # no ambiguity, prob of success is 1
             new.label = f"Dealer used {cmd}"
+            new.parent = state
+            new.command = cmd
+            out.append(new)
 
-            return new,  # tough guy way to make a 1-tuple, always want a tuple from this function
+        return out
 
 
 if __name__ == "__main__":
@@ -514,7 +576,7 @@ if __name__ == "__main__":
         print(f"TURN {trn}")
         #print("current gun mag: ", gm.gun.mag)
         #print("here is the game state now:")
-        #print(gm.game_state.print())
+        print(gm.game_state.simple_print())
         if gm.game_state.current_turn == "PLAYER":
             turn = input(">> ")
             print("============================")
